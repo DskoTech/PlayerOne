@@ -1,0 +1,9 @@
+{
+  "vlc_path": "C:\\Program Files\\VideoLAN\\VLC\\vlc.exe",
+  "http_host": "127.0.0.1",
+  "http_port": 43210,
+  "http_password": "vlccontroller",
+  "volume_step": 5,
+  "seek_step": 5,
+  "cooldown_a": 0.5
+}

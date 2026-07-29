@@ -187,55 +187,155 @@ class _XS(ctypes.Structure):
     _fields_=[("dwPacketNumber",ctypes.wintypes.DWORD),("Gamepad",_GP)]
 
 class XInput:
+    MAX_SLOTS = 4   # XInput supports up to 4 controllers
     def __init__(self):
         self.ok=False; self.lib=None; self._s=_XS()
         for dll in ("xinput1_4.dll","xinput1_3.dll","xinput9_1_0.dll"):
             try: self.lib=ctypes.windll.LoadLibrary(dll); self.ok=True; break
-            except OSError: pass
-    def state(self,i=0):
+            except (OSError, AttributeError): pass
+    def _slot_state(self,i):
         if not self.ok: return None
         if self.lib.XInputGetState(i,ctypes.byref(self._s))!=0: return None
         g=self._s.Gamepad
         return g.wButtons,g.sThumbLX,g.sThumbLY,g.sThumbRX,g.sThumbRY
+    def state(self,i=0):
+        return self._slot_state(i)
+    def states(self):
+        """State of every connected slot (0-3).  Re-queried each call, so
+        plugging/unplugging a pad is handled automatically."""
+        out=[]
+        if not self.ok: return out
+        for i in range(self.MAX_SLOTS):
+            s=self._slot_state(i)
+            if s is not None: out.append(s)
+        return out
+    def count(self):
+        return len(self.states())
 
 class SDL3:
+    _BTN={"a":0,"b":1,"x":2,"y":3,"back":4,"start":6,"ls":7,"rs":8,
+          "lb":9,"rb":10,"du":11,"dd":12,"dl":13,"dr":14}
     def __init__(self):
-        self.ok=False; self._sdl=None; self._gp=None
+        self.ok=False; self._sdl=None; self._gps=[]; self._open_ids=set()
+        self._last_scan=0.0
         for n in ("SDL3.dll","libSDL3.so.0","libSDL3.dylib"):
             try: self._sdl=ctypes.CDLL(n); break
             except OSError: pass
         if not self._sdl: return
         try:
-            self._sdl.SDL_Init(0x200)
+            self._sdl.SDL_Init(0x200)   # SDL_INIT_GAMEPAD
+            self._scan()
+        except Exception: pass
+    def _scan(self):
+        """(Re)enumerate gamepads so newly-plugged pads are picked up."""
+        if not self._sdl: return
+        try:
+            if hasattr(self._sdl,"SDL_UpdateGamepads"):
+                self._sdl.SDL_UpdateGamepads()
             cnt=ctypes.c_int(0)
             ids=self._sdl.SDL_GetGamepads(ctypes.byref(cnt))
-            if cnt.value>0:
-                id0=ctypes.cast(ids,ctypes.POINTER(ctypes.c_uint32))[0]
-                self._gp=self._sdl.SDL_OpenGamepad(id0)
-                if self._gp: self.ok=True
+            if ids and cnt.value>0:
+                arr=ctypes.cast(ids,ctypes.POINTER(ctypes.c_uint32))
+                for i in range(cnt.value):
+                    gid=arr[i]
+                    if gid not in self._open_ids:
+                        gp=self._sdl.SDL_OpenGamepad(gid)
+                        if gp:
+                            self._gps.append(gp); self._open_ids.add(gid)
+            self.ok=len(self._gps)>0
         except Exception: pass
+    def _gp_state(self,gp):
+        try:
+            B=self._BTN
+            def btn(b): return bool(self._sdl.SDL_GetGamepadButton(gp,b))
+            def ax(a): return self._sdl.SDL_GetGamepadAxis(gp,a)
+            bits=0
+            if btn(B["du"]): bits|=DPAD_UP
+            if btn(B["dd"]): bits|=DPAD_DOWN
+            if btn(B["dl"]): bits|=DPAD_LEFT
+            if btn(B["dr"]): bits|=DPAD_RIGHT
+            if btn(B["start"]): bits|=BTN_START
+            if btn(B["back"]):  bits|=BTN_BACK
+            if btn(B["ls"]):    bits|=L3
+            if btn(B["rs"]):    bits|=R3
+            if btn(B["lb"]):    bits|=LB
+            if btn(B["rb"]):    bits|=RB
+            if btn(B["a"]):     bits|=BTN_A
+            if btn(B["b"]):     bits|=BTN_B
+            if btn(B["x"]):     bits|=BTN_X
+            if btn(B["y"]):     bits|=BTN_Y
+            return bits,ax(0),-ax(1),ax(2),-ax(3)
+        except Exception:
+            return None
+    def states(self):
+        if not self.ok: return []
+        # cheap periodic rescan for hot-plugged pads
+        now=time.time()
+        if now-self._last_scan>2.0:
+            self._last_scan=now; self._scan()
+        elif hasattr(self._sdl,"SDL_UpdateGamepads"):
+            try: self._sdl.SDL_UpdateGamepads()
+            except Exception: pass
+        out=[]
+        for gp in list(self._gps):
+            s=self._gp_state(gp)
+            if s is not None: out.append(s)
+        return out
+    def count(self):
+        return len(self._gps)
     def state(self,_=0):
-        if not self.ok or not self._gp: return None
-        B={"a":0,"b":1,"x":2,"y":3,"back":4,"start":6,"ls":7,"rs":8,
-           "lb":9,"rb":10,"du":11,"dd":12,"dl":13,"dr":14}
-        def btn(b): return bool(self._sdl.SDL_GetGamepadButton(self._gp,b))
-        def ax(a): return self._sdl.SDL_GetGamepadAxis(self._gp,a)
-        bits=0
-        if btn(B["du"]): bits|=DPAD_UP
-        if btn(B["dd"]): bits|=DPAD_DOWN
-        if btn(B["dl"]): bits|=DPAD_LEFT
-        if btn(B["dr"]): bits|=DPAD_RIGHT
-        if btn(B["start"]): bits|=BTN_START
-        if btn(B["back"]):  bits|=BTN_BACK
-        if btn(B["ls"]):    bits|=L3
-        if btn(B["rs"]):    bits|=R3
-        if btn(B["lb"]):    bits|=LB
-        if btn(B["rb"]):    bits|=RB
-        if btn(B["a"]):     bits|=BTN_A
-        if btn(B["b"]):     bits|=BTN_B
-        if btn(B["x"]):     bits|=BTN_X
-        if btn(B["y"]):     bits|=BTN_Y
-        return bits,ax(0),-ax(1),ax(2),-ax(3)
+        s=self.states()
+        return s[0] if s else None
+
+
+class ControllerHub:
+    """
+    Aggregates input from ALL connected controllers so any player's pad can
+    drive the shared UI (this is a single-cursor couch app, so inputs are
+    merged rather than split per player).
+
+    - Button bits are OR-ed across every connected pad → any pad's press acts.
+    - Each analog axis takes the largest-magnitude value across pads → whichever
+      controller pushes a stick hardest wins that axis.
+    - Both XInput (up to 4 slots) and SDL gamepads are polled; hot-plugging is
+      handled because both backends re-enumerate while running.
+    """
+    def __init__(self):
+        self.xi = XInput()
+        # Only spin up SDL if XInput found nothing (avoids double-counting the
+        # same pads through two APIs on Windows).
+        self.sdl = None if self.xi.ok else SDL3()
+        self.ok = self.xi.ok or (self.sdl and self.sdl.ok)
+        self._last_count = -1
+
+    def _all_states(self):
+        states=[]
+        states += self.xi.states()
+        if self.sdl: states += self.sdl.states()
+        return states
+
+    def count(self):
+        n=self.xi.count()
+        if self.sdl: n+=self.sdl.count()
+        return n
+
+    def state(self):
+        states=self._all_states()
+        # report connect/disconnect changes once
+        n=len(states)
+        if n!=self._last_count:
+            self._last_count=n
+            print(f"[PlayerOne] Controllers active: {n}")
+        if not states:
+            return None
+        btns=0; lx=ly=rx=ry=0
+        for b,a,c,d,e in states:
+            btns|=b
+            if abs(a)>abs(lx): lx=a
+            if abs(c)>abs(ly): ly=c
+            if abs(d)>abs(rx): rx=d
+            if abs(e)>abs(ry): ry=e
+        return btns,lx,ly,rx,ry
 
 # ─────────────────────────────────────────────────────────
 # VLC HTTP API  —  works with VLC 3.x AND 4.x
@@ -264,10 +364,10 @@ class VLCApi:
     LUA  = "lua"     # /requests/*.json  — VLC 3.x and 4.x
     REST = "rest"    # /api/v2/*         — experimental fallback only
 
-    def __init__(self):
-        h    = CFG["http_host"]
-        p    = CFG["http_port"]
-        pw   = CFG["http_password"]
+    def __init__(self, host=None, port=None, password=None):
+        h    = host     if host     is not None else CFG["http_host"]
+        p    = port     if port     is not None else CFG["http_port"]
+        pw   = password if password is not None else CFG["http_password"]
         self._host = h
         self._port = p
         self._pw   = pw
@@ -1734,10 +1834,11 @@ class RichList(tk.Frame):
     HDR_H=42
     BUFFER=6          # extra rows rendered above/below the viewport
 
-    def __init__(self,parent,on_play,on_need_enrich=None,**kw):
+    def __init__(self,parent,on_play,on_need_enrich=None,on_focus=None,**kw):
         super().__init__(parent,bg=T["bg"],**kw)
         self._on_play=on_play
         self._on_need_enrich=on_need_enrich
+        self._on_focus=on_focus
         self._items=[]            # data only (cheap to hold thousands)
         self._offsets=[]          # cumulative y offset per item
         self._total_h=0
@@ -1912,6 +2013,9 @@ class RichList(tk.Frame):
         return fr
 
     def _click(self,idx):
+        if self._on_focus:
+            try: self._on_focus()
+            except Exception: pass
         if self._cur==idx: self._play(idx)
         else: self._hl(idx)
 
@@ -2039,13 +2143,22 @@ class App:
         self._lib_msg="Scanning library…"
         self._video_hwnd=None; self._video_vis=False
         self._last_state=""
+        # random-mode state
+        self._rand_auto=False          # fully-automated random loop on/off
+        self._rand_job=None            # scheduled after() id for the auto loop
+        self._rand_manual=False        # manual mode: seek controls → random jump
+        self._r_loop=False             # r-key random-time loop
+        self._r_job=None
         self._quitting=False
         self._enrich_cancel=False
         self._enrich_token=None
         self._refresh_pending=False
 
-        xi=XInput()
-        self._ctrl=xi if xi.ok else SDL3()
+        self._ctrl=ControllerHub()
+        if self._ctrl.ok:
+            print(f"[PlayerOne] Controller input ready ({self._ctrl.count()} connected)")
+        else:
+            print("[PlayerOne] No controller detected (keyboard still works)")
 
         self._build_ui()
         self._bind_keyboard()
@@ -2119,7 +2232,7 @@ class App:
             l=tk.Label(self._top_frame,text=tab,bg=T["panel"],fg=T["text"],
                        font=("Segoe UI",12,"bold"),padx=22,pady=12)
             l.pack(side=tk.LEFT)
-            l.bind("<Button-1>",lambda e,i=i:self._select_tab(i))
+            l.bind("<Button-1>",lambda e,i=i:self._on_tab_click(i))
             self._tab_lbls.append(l)
 
         # ── section bar
@@ -2136,9 +2249,11 @@ class App:
         self._vid_frame=tk.Frame(self._body,bg="black")
         self._vid_frame.bind("<Configure>",self._on_vid_resize)
 
+
         # content (rich list)
         self._content=RichList(self._body,on_play=self._play_path,
-                               on_need_enrich=self._enrich_indices)
+                               on_need_enrich=self._enrich_indices,
+                               on_focus=lambda: setattr(self,"zone",self.Z_CONT))
         self._content.pack(side=tk.LEFT,fill=tk.BOTH,expand=True)
 
         # ── queue panel (right, hidden by default)
@@ -2164,6 +2279,7 @@ class App:
         # ── playback bar (taller to hold artwork)
         pb=tk.Frame(self.root,bg=T["panel"],height=90)
         pb.pack(fill=tk.X,side=tk.BOTTOM); pb.pack_propagate(False)
+        self._playback_bar=pb
 
         # Album art thumbnail (64×64)
         self._art_frame=tk.Frame(pb,bg=T["panel"],width=64,height=64)
@@ -2225,6 +2341,8 @@ class App:
 
         # ── status / hint footer
         foot=tk.Frame(self.root,bg=T["bg"]); foot.pack(fill=tk.X,side=tk.BOTTOM)
+        self._foot=foot
+        self._fullscreen=False
         self._lib_lbl=tk.Label(foot,text="",bg=T["bg"],fg=T["subtext"],
                                font=("Segoe UI",8),anchor="w")
         self._lib_lbl.pack(side=tk.LEFT,padx=8)
@@ -2245,7 +2363,7 @@ class App:
             l=tk.Label(self._sec_frame,text=s,bg=T["panel2"],fg=T["subtext"],
                        font=("Segoe UI",10),padx=14,pady=8)
             l.pack(side=tk.LEFT)
-            l.bind("<Button-1>",lambda e,i=i:self._select_section(i))
+            l.bind("<Button-1>",lambda e,i=i:self._on_sec_click(i))
             self._sec_lbls.append(l)
         self.sec_idx=0
         self._cur_sec=secs[0] if secs else ""
@@ -2277,6 +2395,16 @@ class App:
         """
         r = self.root
 
+        # Mouse: after clicking anywhere that isn't a text field, return keyboard
+        # focus to the root so Enter/Space/etc. keep working alongside the mouse.
+        def _global_click(e):
+            w = getattr(e, "widget", None)
+            if isinstance(w, (tk.Entry, tk.Text)):
+                return
+            try: self.root.focus_set()
+            except Exception: pass
+        r.bind("<Button-1>", _global_click, add="+")
+
         # Navigation
         r.bind("<Up>",        lambda e: self._kb_nav(0, -1))
         r.bind("<Down>",      lambda e: self._kb_nav(0,  1))
@@ -2287,12 +2415,12 @@ class App:
         r.bind("<Return>",    lambda e: self._kb_confirm())
         r.bind("<KP_Enter>",  lambda e: self._kb_confirm())
         r.bind("<BackSpace>", lambda e: self._kb_back())
-        r.bind("<Escape>",    lambda e: self._kb_back())
+        r.bind("<Escape>",    lambda e: self._kb_escape())
 
         # Playback shortcuts
         r.bind("<space>",     lambda e: self._kb_space())
-        r.bind("<f>",         lambda e: self.api.fullscreen())
-        r.bind("<F>",         lambda e: self.api.fullscreen())
+        r.bind("<f>",         lambda e: self._toggle_fullscreen())
+        r.bind("<F>",         lambda e: self._toggle_fullscreen())
         r.bind("<Prior>",     lambda e: self.api.prev())   # Page Up
         r.bind("<Next>",      lambda e: self.api.next())   # Page Down
         r.bind("<period>",    lambda e: self.api.next())
@@ -2305,6 +2433,19 @@ class App:
         # Menus
         r.bind("<m>",         lambda e: self._open_start())
         r.bind("<Menu>",      lambda e: self._open_context())  # context-menu key
+
+        # random-mode controls
+        r.bind("<r>",         lambda e: self._kb_r())
+        r.bind("<R>",         lambda e: self._kb_r())
+        r.bind("<bracketleft>",  lambda e: self._seek_or_random(-10))  # [ : back 10s / random
+        r.bind("<bracketright>", lambda e: self._seek_or_random(+10))  # ] : fwd 10s / random
+
+    def _kb_r(self):
+        focused = self.root.focus_get()
+        if isinstance(focused, (tk.Entry, tk.Text)):
+            return
+        self._on_r_key()
+
 
     def _kb_nav(self, dx, dy):
         """Keyboard navigation — skip if focus is in a text entry widget."""
@@ -2327,6 +2468,13 @@ class App:
             self._close_search()
             return
         self._btn_b()
+
+    def _kb_escape(self):
+        # Escape leaves fullscreen first; otherwise behaves like Back.
+        if getattr(self, "_fullscreen", False):
+            self._toggle_fullscreen()
+            return
+        self._kb_back()
 
     def _kb_space(self):
         focused = self.root.focus_get()
@@ -2538,11 +2686,11 @@ class App:
         self.top_idx=idx
         prev_tab=self._cur_tab
         self._cur_tab=self.TABS[idx]
-        # If leaving Video tab, hide the embedded VLC window so it doesn't block UI
+        # Leaving the Video tab → hide its stage
         if prev_tab=="Video" and self._cur_tab!="Video":
             self._hide_video()
-        # If entering Video tab while something is playing, re-show video
-        elif self._cur_tab=="Video" and self._last_state in("playing","paused"):
+        # Entering Video while playing → re-show video
+        if self._cur_tab=="Video" and self._last_state in("playing","paused"):
             self._show_video()
             if self._video_hwnd is None:
                 threading.Thread(target=self._embed_async,daemon=True).start()
@@ -2585,6 +2733,7 @@ class App:
             if s == "All Videos":      items = self._items_fast(LIB.videos, "video")
             elif s == "Recently Added":items = self._items_fast(LIB.recently_added_videos(), "video")
             elif s == "By Folder":     items = self._items_by_folder()
+
 
         elif t == "Music":
             if s == "All Tracks":  items = self._items_fast(LIB.audio, "audio")
@@ -2732,6 +2881,7 @@ class App:
             for p in files:
                 out.append(self._mk(p,p.stem))
         return out
+
 
     DEFAULT_SERVICES = [
         ("NASA TV (Public)",   "https://ntv1.akamaized.net/hls/live/2014075/NASA-NTV1-HLS/master.m3u8"),
@@ -3049,9 +3199,6 @@ class App:
     # ═══════════════════════════════════════════════
     def _on_state_change(self,state):
         if state in ("playing","paused"):
-            # Only try to embed VLC's video window when the user is on the Video tab.
-            # Replacing _content on ALL tabs caused the freeze because the embedded
-            # Win32 window captured all input and blocked Tk's event loop.
             if self._cur_tab == "Video":
                 self._show_video()
                 if self._video_hwnd is None:
@@ -3122,6 +3269,7 @@ class App:
     def _quit(self):
         if self._quitting: return
         self._quitting=True
+        self._rand_auto=False; self._r_loop=False   # stop random loops
         # Close VLC FIRST, then tear down the UI.
         try: self.api.stop()
         except Exception: pass
@@ -3182,8 +3330,13 @@ class App:
             ("Previous",self.api.prev),("Next",self.api.next),
             ("---",None),("VIEW",None),
             ("Show / Hide Queue",self._toggle_queue),
-            ("Toggle Fullscreen",self.api.fullscreen),
+            ("Toggle Fullscreen",self._toggle_fullscreen),
             ("Minimize PlayerOne",self._minimize_self),
+            ("---",None),("RANDOM",None),
+            (("✓ " if self._rand_manual else "")+"Random Mode: Manual (seek = random)",
+                self._toggle_manual_random),
+            (("✓ " if self._rand_auto else "")+"Random Mode: Auto (3–8 s)",
+                self._toggle_auto_random),
             ("---",None),
             (f"LIBRARY  ({lib_count})",None),
             ("Open File…",self._open_file_dlg),
@@ -3247,7 +3400,7 @@ class App:
             ("AUDIO",None),
             ("Volume Up",self.api.vol_up),("Volume Down",self.api.vol_down),
             ("---",None),("VIDEO",None),
-            ("Toggle Fullscreen",self.api.fullscreen),
+            ("Toggle Fullscreen",self._toggle_fullscreen),
             ("---",None),("SUBTITLES",None),
             ("Cycle Subtitle Track",lambda:self.api.cmd("subtitle-track")),
             ("---",None),("LIBRARY",None),
@@ -3273,6 +3426,141 @@ class App:
         else:
             self._queue_panel.pack_forget()
             self.zone=self.Z_CONT
+
+    # ── RANDOM MODES ─────────────────────────────────────
+    def _flash(self, msg):
+        try: self._lib_lbl.config(text=f"  {msg}")
+        except Exception: pass
+        print(f"[PlayerOne] {msg}")
+
+    def _random_video_pool(self):
+        """The 'whole playlist of videos' the random modes jump around in."""
+        return list(LIB.videos)
+
+    def _random_jump(self):
+        """Jump to a RANDOM video at a RANDOM play time."""
+        pool = self._random_video_pool()
+        if not pool:
+            self._flash("Random: no videos in library")
+            return
+        import random
+        p = random.choice(pool)
+        self._play_path(str(p))
+        self.root.after(1200, self._seek_random_time)
+
+    def _seek_random_time(self):
+        """Seek the current media to a random position."""
+        import random
+        st = self._status or {}
+        length = int(st.get("length", 0) or 0)
+        if length > 6:
+            t = random.randint(0, length - 3)
+        else:
+            t = random.randint(0, 300)   # unknown length — VLC clamps past-end
+        self.api.cmd("seek", val=str(t))
+
+    def _toggle_manual_random(self):
+        self._rand_manual = not self._rand_manual
+        self._flash("Manual random mode: " + ("ON — seek jumps randomly"
+                                              if self._rand_manual else "OFF"))
+
+    def _seek_or_random(self, d):
+        """Seek by d seconds, OR (in manual random mode) jump randomly."""
+        if self._rand_manual:
+            self._random_jump()
+        else:
+            self.api.seek(d)
+
+    def _toggle_auto_random(self):
+        self._rand_auto = not self._rand_auto
+        if self._rand_auto:
+            self._flash("Auto random mode: ON (3–8 s). Press R for random-time loop.")
+            self._schedule_auto_random()
+        else:
+            self._flash("Auto random mode: OFF")
+            for job in ("_rand_job", "_r_job"):
+                jid = getattr(self, job)
+                if jid:
+                    try: self.root.after_cancel(jid)
+                    except Exception: pass
+                    setattr(self, job, None)
+            self._r_loop = False
+
+    def _schedule_auto_random(self):
+        if not self._rand_auto:
+            return
+        import random
+        self._random_jump()
+        self._rand_job = self.root.after(random.randint(3000, 8000),
+                                         self._schedule_auto_random)
+
+    def _on_r_key(self):
+        """R toggles a random-time loop within the current video (until R again)."""
+        self._r_loop = not self._r_loop
+        if self._r_loop:
+            self._flash("R: random-time loop ON")
+            self._schedule_r_loop()
+        else:
+            self._flash("R: random-time loop OFF")
+            if self._r_job:
+                try: self.root.after_cancel(self._r_job)
+                except Exception: pass
+                self._r_job = None
+
+    def _schedule_r_loop(self):
+        if not self._r_loop:
+            return
+        import random
+        self._seek_random_time()
+        self._r_job = self.root.after(random.randint(3000, 8000),
+                                      self._schedule_r_loop)
+
+    def _toggle_fullscreen(self):
+        """
+        App-level fullscreen: hide the top nav bar, section bar, playback bar
+        and status footer, and put the window into borderless fullscreen that
+        covers the taskbar.
+
+        Note: this is Tk borderless-fullscreen (the whole screen, no window
+        chrome, over the taskbar) — the closest a Tk/Python app can get.  True
+        GPU 'exclusive' display-mode fullscreen isn't available to Tkinter; the
+        embedded VLC surface fills the screen either way.
+        """
+        self._fullscreen = not self._fullscreen
+        bars = [getattr(self,"_top_frame",None), getattr(self,"_sec_frame",None),
+                getattr(self,"_playback_bar",None), getattr(self,"_foot",None)]
+        if self._fullscreen:
+            for b in bars:
+                if b is not None:
+                    try: b.pack_forget()
+                    except Exception: pass
+            try:
+                self.root.attributes("-fullscreen", True)
+                self.root.attributes("-topmost", True)
+            except Exception: pass
+        else:
+            # restore chrome in original stacking order
+            try: self.root.attributes("-fullscreen", False)
+            except Exception: pass
+            try: self.root.attributes("-topmost", False)
+            except Exception: pass
+            if getattr(self,"_top_frame",None) is not None:
+                self._top_frame.pack(fill=tk.X,side=tk.TOP,before=self._body)
+            if getattr(self,"_sec_frame",None) is not None:
+                self._sec_frame.pack(fill=tk.X,side=tk.TOP,before=self._body)
+            if getattr(self,"_playback_bar",None) is not None:
+                self._playback_bar.pack(fill=tk.X,side=tk.BOTTOM)
+            if getattr(self,"_foot",None) is not None:
+                self._foot.pack(fill=tk.X,side=tk.BOTTOM)
+        # keep the embedded video sized to the (now larger/smaller) frame
+        self.root.after(60, self._resize_embedded_video)
+
+    def _resize_embedded_video(self):
+        if getattr(self,"_video_hwnd",None):
+            try:
+                resize_child(self._video_hwnd, self._vid_frame.winfo_width(),
+                                               self._vid_frame.winfo_height())
+            except Exception: pass
 
     def _minimize_self(self):
         """Minimize the PlayerOne window to the taskbar."""
@@ -3425,7 +3713,7 @@ class App:
                 fired=False
                 if abs(rx)>DEADZONE:
                     d=CFG["seek_step"]*(1 if rx>0 else -1)
-                    self.root.after(0,self.api.seek,d); fired=True
+                    self.root.after(0,self._seek_or_random,d); fired=True
                 if abs(ry)>DEADZONE:
                     self.root.after(0,self.api.vol_up if ry>0 else self.api.vol_down); fired=True
                 dx=1 if lx>DEADZONE else(-1 if lx<-DEADZONE else 0)
@@ -3460,7 +3748,7 @@ class App:
             if pressed(LB):    self.root.after(0,self.api.prev)
             if pressed(RB):    self.root.after(0,self.api.next)
             if pressed(L3):    self.root.after(0,self._open_settings)
-            if pressed(R3):    self.root.after(0,self.api.fullscreen)
+            if pressed(R3):    self.root.after(0,self._toggle_fullscreen)
             self._last_btns=btns
 
     def _nav(self,dx,dy):
@@ -3502,6 +3790,16 @@ class App:
                 idx=min(self._q_list.size()-1,(cur[0]+1) if cur else 0)
             self._q_list.selection_clear(0,tk.END)
             self._q_list.selection_set(idx); self._q_list.see(idx)
+
+    def _on_tab_click(self,i):
+        self._select_tab(i)
+        self.zone=self.Z_SEC
+        self._update_tab_hl(); self._update_sec_hl()
+
+    def _on_sec_click(self,i):
+        self._select_section(i)
+        self.zone=self.Z_CONT
+        self._update_sec_hl()
 
     def _btn_a(self):
         z=self.zone
